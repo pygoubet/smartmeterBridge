@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/hex"
 	"log"
 	"net"
 	"os"
@@ -9,10 +12,35 @@ import (
 
 	"github.com/go-yaml/yaml"
 	"github.com/tarm/serial"
+	"encoding/binary"
 )
 
 const (
 	ServerType = "tcp"
+	// Initial state. Input is ignored until start byte is detected.
+	STATE_IGNORING int = 0
+	// Start byte (hex "DB") has been detected.
+	STATE_STARTED = 1
+	// Length of system title has been read.
+	STATE_HAS_SYSTEM_TITLE_LENGTH = 2
+	// System title has been read.
+	STATE_HAS_SYSTEM_TITLE = 3
+	// Additional byte after the system title has been read.
+	STATE_HAS_SYSTEM_TITLE_SUFFIX = 4
+	// Length of remaining data has been read.
+	STATE_HAS_DATA_LENGTH = 5
+	// Additional byte after the remaining data length has been read.
+	STATE_HAS_SEPARATOR = 6
+	// Frame counter has been read.
+	STATE_HAS_FRAME_COUNTER = 7
+	// Payload has been read.
+	STATE_HAS_PAYLOAD = 8
+	// GCM tag has been read.
+	STATE_HAS_GCM_TAG = 9
+	// All input has been read. After this, we switch back to STATE_IGNORING and wait for a new start byte.
+	STATE_DONE = 10
+	// GCM TAG LENGTH in bytes (96 bits)
+	GCM_TAG_LENGTH = 12
 )
 
 var Paths = []string{"/etc/smartmeter-bridge/config.yml", "config.yml"}
@@ -33,6 +61,8 @@ type Config struct {
 	DSMRVersion string       `yaml:"dsmr_version"`
 	Server      ServerConfig `yaml:"server"`
 	Verbose     bool         `yaml:"verbose"`
+	AESKey      string       `yaml:"aes_key"`
+	AAD         string       `yaml:"aad"`
 }
 
 var config = Config{
@@ -49,6 +79,9 @@ func (c Config) validate() {
 		log.Fatal("Serial port is not configured")
 	}
 	c.Server.validate()
+	if c.DSMRVersion == "5L" && (c.AESKey == "" || c.AAD == "") {
+		log.Fatal("For DSMR 5L, aes_key and aad must be set")
+	}
 }
 
 func getSerialConfig(port, dsmrVersion string) serial.Config {
@@ -163,8 +196,131 @@ func sendTelegrams(connections chan net.Conn, telegrams chan string) {
 
 func ReadRawTelegrams(serialConfig serial.Config, rawTelegrams chan string) {
 	lineChan := make(chan string)
-	go readLines(serialConfig, lineChan)
-	go collectTelegrams(lineChan, rawTelegrams)
+	if config.DSMRVersion == "5L" {
+		go readBuffer(serialConfig, lineChan)
+		go collectEncryptedTelegrams(lineChan, rawTelegrams)
+	} else {
+		go readLines(serialConfig, lineChan)
+		go collectTelegrams(lineChan, rawTelegrams)
+	}
+}
+
+func readBuffer(serialConfig serial.Config, rChan chan string) {
+	s, err := serial.OpenPort(&serialConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	buf := make([]byte, 1024)
+	reader := bufio.NewReader(s)
+	for {
+		n, err := reader.Read(buf)
+		if err != nil && config.Verbose {
+			log.Println(err)
+		}
+
+		if n > 0 {
+			rChan <- string(buf[:n])
+		}
+	}
+}
+
+func collectEncryptedTelegrams(rChan chan string, tChan chan string) {
+	var systemTitleLength int
+	var systemTitle []byte
+	var dataLengthBytes []byte
+	var dataLength int
+	var frameCounter []byte
+	var frame []byte
+	var data []byte
+	var state int = STATE_IGNORING
+	var iv []byte
+
+	for line := range rChan {
+		for _, hexInput := range []byte(line) {
+			// keep the original frame for debugging
+			if state != STATE_IGNORING {
+				frame = append(frame, hexInput)
+			}
+			switch state {
+			case STATE_IGNORING:
+				if hexInput == 0xDB {
+					state = STATE_STARTED
+					systemTitleLength = 0
+					systemTitle = []byte("")
+					dataLengthBytes = []byte("")
+					frameCounter = []byte("")
+					frame = []byte("")
+					data = []byte("")
+					frame = append(frame, hexInput)
+				} else {
+					log.Println("ERROR, expected 0xDB separator byte not found but:", hexInput)
+				}
+			case STATE_STARTED:
+				systemTitleLength = int(hexInput)
+				state = STATE_HAS_SYSTEM_TITLE_LENGTH
+				systemTitle = make([]byte, 0, systemTitleLength)
+			case STATE_HAS_SYSTEM_TITLE_LENGTH:
+				systemTitle = append(systemTitle, hexInput)
+				if len(systemTitle) == systemTitleLength {
+					state = STATE_HAS_SYSTEM_TITLE
+				}
+			case STATE_HAS_SYSTEM_TITLE:
+				if hexInput == 0x82 {
+					state = STATE_HAS_SYSTEM_TITLE_SUFFIX
+				} else {
+					log.Println("ERROR, expected 0x82 separator byte not found, dropping frame")
+					state = STATE_IGNORING
+				}
+			case STATE_HAS_SYSTEM_TITLE_SUFFIX:
+				dataLengthBytes = append(dataLengthBytes, hexInput)
+				if len(dataLengthBytes) == 2 {
+					dataLength = int(binary.BigEndian.Uint16(dataLengthBytes)) - 17 + GCM_TAG_LENGTH
+					state = STATE_HAS_DATA_LENGTH
+					data = make([]byte, 0, dataLength)
+				}
+			case STATE_HAS_DATA_LENGTH:
+				if hexInput == 0x30 {
+					state = STATE_HAS_SEPARATOR
+					} else {
+						log.Println("ERROR, expected 0x30 separator byte not found, dropping frame")
+						state = STATE_IGNORING
+					}
+			case STATE_HAS_SEPARATOR:
+				frameCounter = append(frameCounter, hexInput)
+				if len(frameCounter) == 4 {
+					state = STATE_HAS_FRAME_COUNTER
+				}
+			case STATE_HAS_FRAME_COUNTER:
+				data = append(data, hexInput)
+				if len(data) == dataLength {
+					state = STATE_DONE
+				}
+			} // end switch
+
+			if state == STATE_DONE {
+				// Decrypt data
+				AESKey, _ := hex.DecodeString(config.AESKey)
+				AAD, _ := hex.DecodeString(config.AAD)
+				iv = append(systemTitle, frameCounter...)
+				block, err := aes.NewCipher(AESKey)
+				if err != nil {
+					log.Fatalf("AES error: %v", err)
+				}
+				gcm, err := cipher.NewGCMWithTagSize(block, 12)
+				if err != nil {
+					log.Fatalf("GCM error: %v", err)
+				}
+				plaintext, err := gcm.Open(nil, iv, data, AAD)
+				if err != nil {
+					log.Fatalf("Decryption failed: %v", err)
+				}
+				log.Printf("%s\n", plaintext)
+				tChan <- string(plaintext)
+				state = STATE_IGNORING
+			}
+		}
+	}
 }
 
 func readLines(serialConfig serial.Config, rChan chan string) {

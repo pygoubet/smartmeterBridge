@@ -25,3 +25,8 @@ server:
 
 # enable verbose mode to have the raw telegrams printed to stdOut
 verbose: false
+
+# AES encryption key - to be obtained from the energy supplier
+aes_key: ""
+# AAD - Static for Luxembourg meter
+aad: "3000112233445566778899AABBCCDDEEFF"
