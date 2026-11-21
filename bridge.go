@@ -10,7 +10,6 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
-	"os"
 
 	"github.com/jacobsa/go-serial/serial"
 	"gopkg.in/yaml.v2"

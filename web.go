@@ -247,7 +247,7 @@ const htmlDashboardTemplate = `<!DOCTYPE html>
     evtSource.onmessage = function(event) {
       const data = JSON.parse(event.data);
       document.getElementById('ts').innerText = data.timestamp;
-      document.getElementById('power_del').innerText = data.power_del.toFixed(3);
+      document.getElementById('power_del').innerText = data.power_delivered.toFixed(3);
       document.getElementById('power_ret').innerText = data.power_returned.toFixed(3);
       document.getElementById('volt').innerText = data.voltage_l1.toFixed(1);
       document.getElementById('curr').innerText = data.current_l1.toFixed(1);
@@ -257,4 +257,4 @@ const htmlDashboardTemplate = `<!DOCTYPE html>
     };
   </script>
 </body>
-</html>
+</html>`
