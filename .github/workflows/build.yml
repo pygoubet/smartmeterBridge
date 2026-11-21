@@ -1,0 +1,55 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ "decrypt_5L", "main", "master" ]
+  pull_request:
+    branches: [ "decrypt_5L", "main", "master" ]
+
+jobs:
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm, arm64]
+        include:
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          check-latest: true
+
+      - name: Verify dependencies
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum || (echo "go.mod/go.sum changed after tidy" && exit 1)
+        continue-on-error: true
+
+      - name: Build smartmeterBridge
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          OUTPUT_NAME="smartmeterBridge-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ -n "${{ matrix.goarm }}" ]; then
+            OUTPUT_NAME="smartmeterBridge-${{ matrix.goos }}-${{ matrix.goarch }}v${{ matrix.goarm }}"
+          fi
+          go build -v -ldflags="-s -w" -o "dist/${OUTPUT_NAME}" .
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartmeterBridge-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
+          path: dist/*
