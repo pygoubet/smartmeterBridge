@@ -5,11 +5,13 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
+	"os"
 
 	"github.com/jacobsa/go-serial/serial"
 	"gopkg.in/yaml.v2"
@@ -31,14 +33,14 @@ type Config struct {
 	} `yaml:"web"`
 }
 
-func (c *Config) readConfig() {
-	yamlFile, err := ioutil.ReadFile("config.yml")
+func (c *Config) readConfig(path string) {
+	yamlFile, err := ioutil.ReadFile(path)
 	if err != nil {
-		log.Printf("yamlFile.Get err   #%v ", err)
+		log.Fatalf("Error reading config file %s: %v", path, err)
 	}
 	err = yaml.Unmarshal(yamlFile, c)
 	if err != nil {
-		log.Fatalf("Unmarshal: %v", err)
+		log.Fatalf("Unmarshal error in %s: %v", path, err)
 	}
 }
 
@@ -227,45 +229,70 @@ func handleServerConnections(server net.Listener, telegrams chan string, webServ
 				webServer.Broadcast(telegram)
 			}
 
-			for i, client := range clients {
-				_, err := client.Write([]byte(telegram))
-				if err != nil {
-					client.Close()
-					clients = append(clients[:i], clients[i+1:]...)
+			if server != nil {
+				for i, client := range clients {
+					_, err := client.Write([]byte(telegram))
+					if err != nil {
+						client.Close()
+						clients = append(clients[:i], clients[i+1:]...)
+					}
 				}
 			}
 		}
 	}()
 
-	for {
-		conn, err := server.Accept()
-		if err != nil {
-			log.Printf("Failed to accept connection: %v", err)
-			continue
+	if server != nil {
+		for {
+			conn, err := server.Accept()
+			if err != nil {
+				log.Printf("Failed to accept connection: %v", err)
+				continue
+			}
+			clients = append(clients, conn)
 		}
-		clients = append(clients, conn)
+	} else {
+		// Keep the main goroutine alive if no TCP server was configured
+		select {}
 	}
 }
 
 func main() {
-	var c Config
-	c.readConfig()
+	configPath := flag.String("config", "config.yml", "Path to YAML configuration file")
+	flag.Parse()
 
-	if c.Web.Port == 0 {
-		c.Web.Port = 8080
+	// Also support positional argument, e.g.: ./smartmeterBridge /path/to/config.yml
+	if flag.NArg() > 0 {
+		*configPath = flag.Arg(0)
 	}
+
+	if _, err := os.Stat(*configPath); os.IsNotExist(err) {
+		log.Fatalf("Config file not found: %s", *configPath)
+	}
+
+	var c Config
+	c.readConfig(*configPath)
 
 	var webServer *WebServer
 	if c.Web.Enabled {
+		if c.Web.Port == 0 {
+			c.Web.Port = 8080
+		}
 		webServer = NewWebServer()
 		webServer.Start(c.Web.Host, c.Web.Port)
 	}
 
-	tcpServer, err := startServer(c.Server.Host, c.Server.Port)
-	if err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	var tcpServer net.Listener
+	if c.Server.Port != 0 {
+		var err error
+		tcpServer, err = startServer(c.Server.Host, c.Server.Port)
+		if err != nil {
+			log.Fatalf("Failed to start TCP server on %s:%d: %v", c.Server.Host, c.Server.Port, err)
+		}
+		log.Printf("Listening for TCP raw telegram clients on %s:%d", c.Server.Host, c.Server.Port)
+		defer tcpServer.Close()
+	} else {
+		log.Println("TCP server disabled (server.port is not set or 0)")
 	}
-	defer tcpServer.Close()
 
 	serialPort, err := openSerialPort(c.SerialPort, c.DsmrVersion)
 	if err != nil {
